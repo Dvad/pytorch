@@ -1,7 +1,7 @@
 # mypy: allow-untyped-defs
 
 import contextlib
-import enum
+import functools
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -51,25 +51,21 @@ class OutputMetadata:
     indexes_with_no_grad: set[int] = field(default_factory=set)
 
 
-class NestedCompileBackend(enum.Enum):
-    INDUCTOR = "inductor"
-    DEFAULT = "default"
-
-
 @dataclass
 class NestedCompileRegionOptions:
-    # If default, does nothing, inherient the torch.compile backend
-    # If "inductor", will add {"compile_with_inductor": {"inductor_configs":config}} to HOP node meta "custom"
-    # If "custom" already has "compile_with_inductor", this config will override
-    backend: NestedCompileBackend = NestedCompileBackend.DEFAULT
+    # A Callable that takes (gm, example_inputs, decompositions=None, **kwargs) as inputs.
+    fw_compiler: Callable
+    bw_compiler: Callable
 
-    # If backend == "inductor", the configs
-    inductor_configs: Optional[dict[str, Any]] = None
+    # Note: [InvokeSubgraphHOP Partitioner]
+    # If not None, add "partitioner" to HOP node meta.
+    # If Callable, directly assign the callable, but the callable cannot be pickled
+    # If str, the options are "default_partition" and "min_cut_rematerialization_partition".
+    # The HOP joint graph will be partitioned using the corresponding functions in
+    # torch/_functorch/partitioners.py
+    partitioner: Optional[Callable | str] = None
 
-    # If not None, add "partitioner" to HOP node meta
-    partitioner: Optional[Callable] = None
-
-    # TODO: add decomposition function
+    decompositions: Optional[dict[str, Any]] = None
 
 
 class InvokeSubgraphHOP(HigherOrderOperator):
@@ -174,7 +170,7 @@ def invoke_subgraph_placeholder(func, *args, **kwargs):
 
 
 def mark_compile_region(
-    fn=None, backend_options: Optional[NestedCompileRegionOptions] = None
+    fn=None, aot_config: Optional[NestedCompileRegionOptions] = None
 ):
     """
     This wrapper instructs torch.compile to compile the wrapped region once and
@@ -186,7 +182,9 @@ def mark_compile_region(
 
     Args:
         fn: The function to wrap
-        backend: Optional backend to use for compiling the subgraph
+        aot_config: Optional config to use for compiling the subgraph.
+            Warning: this is an experimental feature under development and
+            not ready for use yet.
     """
 
     def wrap(func):
@@ -198,7 +196,7 @@ def mark_compile_region(
             return invoke_subgraph_placeholder(inner_func, *args, **kwargs)
 
         inner.__marked_compile_region_fn__ = func  # type: ignore[attr-defined]
-        func.__marked_compile_region_backend__ = backend_options  # type: ignore[attr-defined]
+        func.__marked_compile_region_config__ = aot_config  # type: ignore[attr-defined]
 
         return inner
 
@@ -796,4 +794,66 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
     example_out = invoke_subgraph(graph, identifier, *operands)
     return track_tensor_tree(
         example_out, out_proxy, constant=None, tracer=proxy_mode.tracer
+    )
+
+
+def invoke_subgraph_inductor_compile(
+    gm, example_inputs, inductor_config_patches=None, decompositions=None, **kwargs
+):
+    from torch._functorch._aot_autograd.runtime_wrappers import (
+        SerializableCompiledFunction,
+    )
+    from torch._functorch._aot_autograd.utils import simple_wraps
+    from torch._inductor import config
+    from torch._inductor.compile_fx import compile_fx_inner
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    if decompositions:
+        gm = make_fx(gm, decomposition_table=decompositions)(*example_inputs)
+    if inductor_config_patches is None:
+        inductor_config_patches = {}
+    compile_fn = config.patch(inductor_config_patches)(compile_fx_inner)
+    compiled_fn_inner = compile_fn(gm, example_inputs)
+
+    @simple_wraps(compiled_fn_inner)
+    def forward(*runtime_args: tuple[Any]):
+        full_args = []
+        full_args.extend(runtime_args)
+        return compiled_fn_inner(full_args)
+
+    # Just for convenience
+    forward.zero_grad = gm.zero_grad  # type: ignore[attr-defined]
+    forward.named_parameters = gm.named_parameters  # type: ignore[attr-defined]
+    forward.named_buffers = gm.named_buffers  # type: ignore[attr-defined]
+
+    # TODO: add a real cache function
+    # entry = _cache_inference_info(
+    #     aot_config,
+    #     fw_metadata,
+    #     maybe_subclass_meta,
+    #     compiled_fw,
+    #     aot_forward_graph_str,
+    #     wrappers,
+    # )
+
+    # TODO: Do we need the post compile passes in _aot_stage2b_compile_forward_or_inference?
+
+    forward.serialize = SerializableCompiledFunction(forward, lambda: None)  # type: ignore[attr-defined]
+    return forward
+
+
+def get_invoke_subgraph_compile_options(
+    inductor_config_patches=None,
+    decompositions=None,
+    partitioner="min_cut_rematerialization_partition",
+):
+    inductor_compile = functools.partial(
+        invoke_subgraph_inductor_compile,
+        inductor_config_patches=inductor_config_patches,
+    )
+    return NestedCompileRegionOptions(
+        fw_compiler=inductor_compile,
+        bw_compiler=inductor_compile,
+        partitioner=partitioner,
+        decompositions=decompositions,
     )

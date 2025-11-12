@@ -10,16 +10,17 @@ import torch.utils.checkpoint
 from torch._dynamo.backends.common import aot_autograd
 from torch._functorch._aot_autograd.autograd_cache import BundledCompiledForward
 from torch._guards import detect_fake_mode
-from torch._higher_order_ops.invoke_subgraph import (
-    NestedCompileBackend,
-    NestedCompileRegionOptions,
-)
+from torch._higher_order_ops.invoke_subgraph import get_invoke_subgraph_compile_options
 from torch._inductor.output_code import RegionalOutputCode
 from torch._inductor.test_case import run_tests
 from torch._inductor.utils import run_fw_bw_and_get_code
 from torch.fx._graph_pickler import GraphPickler
 from torch.fx.passes.regional_inductor import regional_inductor
+from torch.fx.passes.regional_inductor_invoke_subgraph import (
+    regional_inductor_invoke_subgraph,
+)
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.testing import FileCheck
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -53,11 +54,14 @@ if TYPE_CHECKING:
 #   f) disallow nested regional compile
 
 
-def aot_eager_regional_inductor(serialize=False):
+def aot_eager_regional_inductor(serialize=False, on_invoke_subgrah=False):
+    regional_inductor_fn = (
+        regional_inductor_invoke_subgraph if on_invoke_subgrah else regional_inductor
+    )
     if serialize:
 
         def regional_inductor_pickle(gm, *example_args):
-            result = regional_inductor(gm, *example_args)
+            result = regional_inductor_fn(gm, *example_args)
             serialized = GraphPickler.dumps(result)
 
             fake_mode = detect_fake_mode(example_args)
@@ -77,8 +81,8 @@ def aot_eager_regional_inductor(serialize=False):
         )
 
     return aot_autograd(
-        fw_compiler=regional_inductor,
-        bw_compiler=regional_inductor,
+        fw_compiler=regional_inductor_fn,
+        bw_compiler=regional_inductor_fn,
     )
 
 
@@ -472,25 +476,73 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         # flex in forward and flex_backward in backward
         self.assertEqual(len(codes), 2)
 
-    @parametrize("serialize", [False])  # , True
-    def test_invoke_subgraph_regional_compile(self, serialize):
-        call_test_partitioner_ct = 0
+    @torch._dynamo.config.patch("enable_invoke_subgraph_regional_compile", True)
+    @parametrize("serialize", [False])  # True,
+    def test_invoke_subgraph_regional_compile_decomposition(self, serialize):
+        def my_sin_decomp(x):
+            return torch.cos(x)
 
-        def test_partitioner(*args, **kwargs):
-            nonlocal call_test_partitioner_ct
-            call_test_partitioner_ct += 1
-            return torch._functorch.partitioners.default_partition(*args, **kwargs)
-
-        backend = NestedCompileRegionOptions(
-            backend=NestedCompileBackend.INDUCTOR,
-            inductor_configs={
-                "max_autotune": True,
-                "triton.cudagraphs": False,
-            },
-            partitioner=test_partitioner,
+        decompositions = {torch.ops.aten.sin.default: my_sin_decomp}
+        nested_config = get_invoke_subgraph_compile_options(
+            decompositions=decompositions
         )
 
-        @torch.compiler.nested_compile_region(backend_options=backend)
+        @torch.compiler.nested_compile_region(aot_config=nested_config)
+        def gn_with_backend(x):
+            return torch.sin(x)
+
+        @torch.compiler.nested_compile_region
+        def gn_without_backend(x):
+            return torch.sin(x)
+
+        def fn(x):
+            return gn_with_backend(x) + gn_without_backend(x)
+
+        backend = aot_eager_regional_inductor(
+            serialize=serialize, on_invoke_subgrah=True
+        )
+
+        opt_fn = torch.compile(fn, backend=backend, fullgraph=True)
+
+        x = torch.randn(8, 8, requires_grad=True)
+        res, codes = run_fw_bw_and_get_code(lambda: opt_fn(x))
+        self.assertEqual(len(codes), 2)
+        true_res = torch.sin(x) + torch.cos(x)
+        self.assertEqual(res, true_res)
+
+    @torch._dynamo.config.patch("enable_invoke_subgraph_regional_compile", True)
+    @parametrize("serialize", [False])  # True,
+    def test_invoke_subgraph_regional_compile(self, serialize):
+        call_test_partitioner_ct = 0
+        original_mincut_partitioner = (
+            torch._functorch.partitioners.min_cut_rematerialization_partition
+        )
+
+        def test_partitioner(
+            *args, **kwargs
+        ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule]:
+            nonlocal call_test_partitioner_ct
+            call_test_partitioner_ct += 1
+            return original_mincut_partitioner(*args, **kwargs)
+
+        # pyrefly: ignore [not-iterable]
+        if serialize:
+            # Callable cannot be serialized
+            torch._functorch.partitioners.default_partition = test_partitioner
+            partitioner = "default_partition"
+        else:
+            partitioner = test_partitioner
+
+        config_patches = {
+            "max_autotune": True,
+            "triton.cudagraphs": False,
+        }
+        decompositions = {}
+        nested_config = get_invoke_subgraph_compile_options(
+            config_patches, decompositions, partitioner
+        )
+
+        @torch.compiler.nested_compile_region(aot_config=nested_config)
         def gn_with_backend(x):
             return torch.sin(x)
 
@@ -501,43 +553,30 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         def fn(x):
             return gn_with_backend(x) + gn_without_backend(x)
 
-        backend = aot_eager_regional_inductor(serialize=serialize)
+        backend = aot_eager_regional_inductor(
+            serialize=serialize, on_invoke_subgrah=True
+        )
         opt_fn = torch.compile(fn, backend=backend, fullgraph=True)
-
-        import torch._inductor.config as inductor_config
-
-        # Hook to verify options
-        original_compile = torch._inductor.standalone_compile
-        captured_options = []
-
-        def verify_options(*args, **kwargs):
-            options = kwargs.get("options", {})
-            captured_options.append(options)
-
-            # Verify config is set as expected from explicit options
-            assert inductor_config.max_autotune, "max_autotune should be True"
-            assert not inductor_config.triton.cudagraphs, (
-                "triton.cudagraphs should be False"
-            )
-
-            return original_compile(*args, **kwargs)
-
-        torch._inductor.standalone_compile = verify_options
 
         try:
             x = torch.randn(8, 8, requires_grad=True)
             # opt_fn(x)
             res, codes = run_fw_bw_and_get_code(lambda: opt_fn(x))
             self.assertEqual(len(codes), 2)
-            self.assertTrue("repeated_subgraph0" in codes[0])
-            self.assertTrue("repeated_subgraph1" not in codes[0])
-            self.assertTrue("repeated_subgraph0" in codes[1])
-            self.assertTrue("repeated_subgraph1" not in codes[1])
+
+            FileCheck().check("partitioned_fw_subgraph_0_0").check("fused_sin_0").run(
+                codes[0]
+            )
+            FileCheck().check("partitioned_bw_subgraph_0_0").check(
+                "fused_cos_mul_0"
+            ).run(codes[1])
             self.assertEqual(call_test_partitioner_ct, 1)
             true_res = fn(x)
             self.assertEqual(res, true_res)
         finally:
-            torch._inductor.standalone_compile = original_compile
+            torch._functorch.partitioners.min_cut_rematerialization_partition = (
+                original_mincut_partitioner
+            )
 
 
 @skipIfTorchDynamo("Not a suitable dynamo wrapped test")
