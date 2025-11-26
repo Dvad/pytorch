@@ -122,7 +122,8 @@ bool gemm_and_bias(
     const Dtype* bias,
     C_Dtype* result_ptr,
     int64_t result_ld,
-    GEMMAndBiasActivationEpilogue activation = GEMMAndBiasActivationEpilogue::None);
+    GEMMAndBiasActivationEpilogue activation = GEMMAndBiasActivationEpilogue::None,
+    C_Dtype* pre_activation_ptr = nullptr);
 
 void int8_gemm(
     bool transpose_mat1,
