@@ -37,15 +37,25 @@ class StaticallyLaunchedTritonKernel:
 
     @cached_property
     def C_impl(self):
+        if self.device_type == "xpu":
+            from torch._C import _StaticXpuLauncher
+
+            return _StaticXpuLauncher
+
         from torch._C import _StaticCudaLauncher
 
         return _StaticCudaLauncher
 
-    def __init__(self, kernel: CompiledKernel) -> None:
+    def __init__(self, kernel: CompiledKernel, device_type: str = "cuda") -> None:
         # pyrefly: ignore [missing-attribute]
         self.name = kernel.src.fn.__name__
         # pyrefly: ignore [missing-attribute]
-        self.cubin_raw = kernel.asm.get("cubin", None)
+        if "zebin" in kernel.asm:
+            # pyrefly: ignore [missing-attribute]
+            self.cubin_raw = kernel.asm["zebin"]
+        else:
+            # pyrefly: ignore [missing-attribute]
+            self.cubin_raw = kernel.asm.get("cubin", None)
         # pyrefly: ignore [missing-attribute]
         self.cubin_path = kernel._cubin_path
 
@@ -60,6 +70,7 @@ class StaticallyLaunchedTritonKernel:
 
         # pyrefly: ignore [missing-attribute]
         self.hash = kernel.hash
+        self.device_type = device_type
 
         if triton_knobs is None:
             # pyrefly: ignore [missing-attribute]
